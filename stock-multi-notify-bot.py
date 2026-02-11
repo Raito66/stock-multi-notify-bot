@@ -279,7 +279,6 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
 
     # 先新增到股票清單
     success_add = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
-
     if not success_add:
         await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗，請檢查權限")
         return
@@ -292,24 +291,39 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         ).execute()
         values = result.get('values', [])
 
-        # 找出最新一筆符合「新增」＋「股票代碼」＋「待審核」的記錄
+        # 找出最新一筆符合條件的待審核記錄
         latest_row_num = None
         latest_time = None
+        latest_status_raw = None
 
         for idx, row in enumerate(values):
-            if len(row) >= 6:
-                action = row[2]
-                code = str(row[3]).strip()
-                status = row[5] if len(row) > 5 else ""
-                request_time = row[0] if row[0] else ""
+            if len(row) < 6:
+                continue
 
-                if action == "新增" and code == stock_id_str and status == "待審核":
-                    if latest_time is None or request_time > latest_time:
-                        latest_time = request_time
-                        latest_row_num = idx + 2  # Sheets 從 1 開始，標題佔 1，所以 +2
+            action = str(row[2]).strip() if row[2] is not None else ""
+            code_raw = row[3]
+            code = str(code_raw).strip().zfill(4) if code_raw is not None else ""
+            status_raw = row[5] if len(row) > 5 and row[5] is not None else None
+            status = str(status_raw).strip() if status_raw is not None else ""
+
+            # debug 輸出（可觀察實際讀到的值，之後可註解掉）
+            print(f"檢查第 {idx+2} 列:")
+            print(f"  action: '{action}'")
+            print(f"  code: '{code}'")
+            print(f"  status: '{status}' (原始: {status_raw!r}, 長度: {len(status) if status else 0})")
+
+            # 比對條件（放寬 status 判斷）
+            if (action == "新增" and
+                code == stock_id_str and
+                status and "待審核" in status):   # 改成包含「待審核」即可，避免空白或變形問題
+
+                request_time = str(row[0]).strip() if row[0] else ""
+                if latest_time is None or request_time > latest_time:
+                    latest_time = request_time
+                    latest_row_num = idx + 2
+                    latest_status_raw = status_raw
 
         if latest_row_num is not None:
-            # 更新最新那筆
             update_range = f"{REQUEST_SHEET}!F{latest_row_num}:G{latest_row_num}"
             update_values = [["已通過", "管理員已審核通過"]]
 
@@ -322,13 +336,15 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
 
             await ctx.send(
                 f"**已審核通過**：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
-                f"已將最新申請（時間：{latest_time}）狀態更新為「已通過」"
+                f"已更新申請時間 {latest_time} 的記錄為「已通過」"
             )
+            print(f"成功更新第 {latest_row_num} 列，原狀態: {latest_status_raw!r}")
         else:
             await ctx.send(
                 f"**已成功新增** **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
                 f"但未找到任何「待審核」的對應申請記錄，狀態未自動更新，請手動檢查「申請清單」分頁"
             )
+            print("沒有找到任何符合條件的待審核記錄")
 
     except Exception as e:
         write_log(f"審核新增時更新申請狀態失敗：{e}")
