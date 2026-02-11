@@ -358,9 +358,9 @@ def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> boo
                 write_log(f"盤中檢查：{yesterday} 無交易資料，今天很可能休市")
                 return False
 
-        # 盤後：不再依賴當天日K資料，直接視為交易日（解決盤後早期無資料問題）
+        # 盤後：直接視為交易日，不依賴當天日K資料
         else:
-            write_log(f"盤後模式：直接視為交易日，不檢查當天日K")
+            write_log(f"盤後模式：直接視為交易日（忽略當天日K尚未補齊）")
             return True
 
     except Exception as e:
@@ -677,17 +677,17 @@ async def monitor_stocks():
 
             msg = [
                 f"---",
-                f"【{stock_id} {stock_name} 盤後監控 {now.strftime('%Y年%m月%d日')}】",
+                f"【{stock_id} {stock_name} 價格監控 {now.strftime('%Y年%m月%d日')}】",
                 f"時間：{now_str}",
                 "━━━━━━━━━━━━━━",
-                f"最新價：{stock['latest_price']:.2f} 元{source_note}",
+                f"最新價：{latest:.2f} 元{source_note}",
                 f"昨收：{yesterday_close:.2f} 元",
                 f"漲跌：{change:+.2f}（{pct:+.2f}%）",
                 f"5日均線：{ma5_str}",
                 f"20日均線：{ma20_str}",
                 f"60日均線：{ma60_str}",
                 f"今日收盤：{close_price:.2f} 元{close_note}",
-                f"行情摘要：{get_after_close_summary(stock['latest_price'], ma5, ma20, ma60, change)}",
+                f"行情摘要：{get_after_close_summary(latest, ma5, ma20, ma60, change)}",
                 footnote
             ]
 
