@@ -1,1 +1,0 @@
-worker: python stock-multi-notify-bot.py

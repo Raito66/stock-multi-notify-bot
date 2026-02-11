@@ -1,13 +1,11 @@
 import os
-from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
-
-import discord
-from discord.ext import commands, tasks
 from dotenv import load_dotenv
 load_dotenv()
 
 import json
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+
 import pandas as pd
 from FinMind.data import DataLoader
 import requests
@@ -21,23 +19,26 @@ GOOGLE_SHEETS_CREDENTIALS = os.getenv("GOOGLE_SHEETS_CREDENTIALS")
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")
 FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
-if not all([GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_ID, FINMIND_TOKEN, DISCORD_BOT_TOKEN]):
+if not all([GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_ID, FINMIND_TOKEN]):
     raise RuntimeError("缺少必要的環境變數")
 
 # ======================== 參數設定 ========================
-SHEET_NAME = "股票清單"          # 正式清單分頁名稱（用來顯示 log）
-SHEET_INDEX = 0                   # 分頁索引（0 = 第一個分頁，改成你的實際索引）
-REQUEST_SHEET_NAME = "申請清單"
-MONITOR_INTERVAL_MINUTES = 5
+STOCK_LIST = ["2330", "6770", "3481", "2337", "2344", "2409", "2367"]
+HISTORY_DAYS = 365
+SHEET_NAME = "Sheet1"
 
-# ======================== Discord Bot 設定 ========================
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix='!', intents=intents)
+STOCK_NAME_MAP = {
+    "2330": "台積電",
+    "6770": "力積電",
+    "3481": "群創",
+    "2337": "旺宏",
+    "2344": "華邦電",
+    "2409": "友達",
+    "2367": "燿華"
+}
 
-# ======================== Google Sheets 相關函式 ========================
+# ==========================================================
 def get_sheets_service():
     try:
         creds_json = GOOGLE_SHEETS_CREDENTIALS
@@ -52,124 +53,6 @@ def get_sheets_service():
     except Exception as e:
         print(f"⚠️ Google Sheets 連線失敗：{e}")
         return None
-
-
-def get_stock_info_from_sheets(service, spreadsheet_id, sheet_index=SHEET_INDEX):
-    try:
-        # 使用分頁索引（0 = 第一個分頁）避免中文名稱問題
-        sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheet_name = sheet_metadata['sheets'][sheet_index]['properties']['title']
-        range_name = f"'{sheet_name}'!A2:B"
-
-        result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
-            range=range_name
-        ).execute()
-
-        values = result.get('values', [])
-        stock_dict = {}
-        for row in values:
-            if len(row) >= 1:
-                code = row[0].strip()
-                if len(code) == 4 and code.isdigit():
-                    name = row[1].strip() if len(row) > 1 and row[1].strip() else code
-                    stock_dict[code] = name
-
-        if not stock_dict:
-            print("未讀到股票資料，使用預設清單")
-            return {
-                "2330": "台積電", "6770": "力積電", "3481": "群創",
-                "2337": "旺宏", "2344": "華邦電", "2409": "友達", "2367": "燿華"
-            }
-
-        print(f"從 Google Sheets 分頁 '{sheet_name}' 讀到 {len(stock_dict)} 支股票：{list(stock_dict.keys())}")
-        return stock_dict
-
-    except Exception as e:
-        print(f"讀取股票資訊失敗：{e}")
-        return {
-            "2330": "台積電", "6770": "力積電", "3481": "群創",
-            "2337": "旺宏", "2344": "華邦電", "2409": "友達", "2367": "燿華"
-        }
-
-
-def append_request_to_sheets(service, action, stock_id, stock_name="", requester=""):
-    now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    values = [[now_str, requester, action, stock_id, stock_name, "待審核", ""]]
-
-    try:
-        service.spreadsheets().values().append(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{REQUEST_SHEET_NAME}!A:G",
-            valueInputOption="USER_ENTERED",
-            body={"values": values}
-        ).execute()
-        print(f"申請已寫入：{action} {stock_id}")
-        return True
-    except Exception as e:
-        print(f"寫入申請失敗：{e}")
-        return False
-
-
-# ======================== Discord 指令 ========================
-@bot.event
-async def on_ready():
-    print(f"機器人已上線：{bot.user}")
-    monitor_stocks.start()
-
-
-@bot.command(name="新增股票")
-@commands.cooldown(1, 60, commands.BucketType.user)
-async def add_stock(ctx, stock_id: str, *, stock_name: str = ""):
-    stock_id = stock_id.strip()
-    if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字，例如 2330")
-        return
-
-    requester = f"{ctx.author} ({ctx.author.id})"
-    success = append_request_to_sheets(
-        get_sheets_service(),
-        "新增",
-        stock_id,
-        stock_name.strip(),
-        requester
-    )
-
-    if success:
-        await ctx.send(f"已收到申請：新增 **{stock_id}** {stock_name}\n請等待管理員審核。")
-    else:
-        await ctx.send("申請失敗，請稍後再試或聯絡管理員。")
-
-
-@bot.command(name="移除股票")
-@commands.cooldown(1, 60, commands.BucketType.user)
-async def remove_stock(ctx, stock_id: str):
-    stock_id = stock_id.strip()
-    if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字")
-        return
-
-    requester = f"{ctx.author} ({ctx.author.id})"
-    success = append_request_to_sheets(
-        get_sheets_service(),
-        "移除",
-        stock_id,
-        "",
-        requester
-    )
-
-    if success:
-        await ctx.send(f"已收到申請：移除 **{stock_id}**\n請等待管理員審核。")
-    else:
-        await ctx.send("申請失敗，請稍後再試或聯絡管理員。")
-
-
-# ======================== 工具函式 ========================
-def write_log(msg):
-    now_str = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
-    with open("error.log", "a", encoding="utf-8") as f:
-        f.write(f"{now_str} {msg}\n")
-    print(f"{now_str} {msg}")
 
 
 def send_discord_push(message: str):
@@ -187,10 +70,25 @@ def send_discord_push(message: str):
         write_log(f"Discord 推播失敗：{e}")
 
 
+def write_log(msg):
+    now_str = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+    with open("error.log", "a", encoding="utf-8") as f:
+        f.write(f"{now_str} {msg}\n")
+    print(f"{now_str} {msg}")
+
+
+# ======================== 交易日判斷 ========================
 def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> bool:
-    symbol_for_check = "2330"
+    """
+    判斷指定日期是否為台股交易日
+    - 盤後：優先檢查當天是否有日K資料
+    - 盤中：檢查昨天是否有交易資料（用來推估今天是否可能開盤）
+    """
+    symbol_for_check = "2330"  # 使用台積電作為代表股票
+
     try:
         if is_after_close:
+            # 盤後：檢查今天是否有日K資料
             df = dl.taiwan_stock_daily(symbol_for_check, start_date=check_date, end_date=check_date)
             if not df.empty:
                 write_log(f"盤後檢查：{check_date} 有日K資料，視為交易日")
@@ -199,6 +97,7 @@ def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> boo
                 write_log(f"盤後檢查：{check_date} 無日K資料，視為非交易日")
                 return False
         else:
+            # 盤中：檢查昨天是否有資料
             yesterday = (datetime.strptime(check_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
             df = dl.taiwan_stock_daily(symbol_for_check, start_date=yesterday, end_date=yesterday)
             if not df.empty:
@@ -212,6 +111,7 @@ def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> boo
         return False
 
 
+# ======================== 價格取得函式 ========================
 def get_latest_available_price(dl, stock_id: str):
     tz = timezone(timedelta(hours=8))
     today = datetime.now(tz).strftime("%Y-%m-%d")
@@ -341,6 +241,7 @@ def calculate_ma(prices, window):
     return pd.Series(prices).rolling(window).mean().iloc[-1]
 
 
+# ======================== Google Sheets ========================
 def save_to_sheets(service, stock_id, stock_name, date, price, ma5, ma20, ma60, timestamp):
     if not service:
         return False
@@ -359,6 +260,7 @@ def save_to_sheets(service, stock_id, stock_name, date, price, ma5, ma20, ma60, 
         return False
 
 
+# ======================== 盤中建議 ========================
 def get_intraday_advice(latest, ma5, ma20, ma60, pct):
     if not (ma5 and ma20):
         return "均線資料不夠，先等等看比較好"
@@ -414,20 +316,18 @@ def get_after_close_summary(latest, ma5, ma20, ma60, change):
         return "今天價格有變動，明天再看情況決定要不要買"
 
 
-# ======================== 定時監控任務 ========================
-@tasks.loop(minutes=MONITOR_INTERVAL_MINUTES)
-async def monitor_stocks():
-    now = datetime.now(timezone(timedelta(hours=8)))
+# ======================== 主程式 ========================
+def main():
+    tz = timezone(timedelta(hours=8))
+    now = datetime.now(tz)
     now_str = now.strftime("%Y年%m月%d日 %H時%M分%S秒")
-    write_log(f"開始定時監控：{now_str}")
+    hour = now.hour
+    minute = now.minute
+    today_str = now.strftime("%Y-%m-%d")
+
+    write_log(f"🕐 台灣時間：{now_str}")
 
     service = get_sheets_service()
-    if not service:
-        return
-
-    STOCK_NAME_MAP = get_stock_info_from_sheets(service, GOOGLE_SHEET_ID)
-    STOCK_LIST = list(STOCK_NAME_MAP.keys())
-
     dl = DataLoader()
     try:
         dl.login_by_token(FINMIND_TOKEN)
@@ -435,16 +335,18 @@ async def monitor_stocks():
         write_log(f"FinMind 登入失敗：{e}")
         return
 
-    is_after_close = now.hour > 13 or (now.hour == 13 and now.minute >= 30)
+    # ==================== 交易日檢查 ====================
+    is_after_close = hour > 13 or (hour == 13 and minute >= 30)
 
-    if not is_trading_day(dl, now.strftime("%Y-%m-%d"), is_after_close):
-        write_log(f"今天非交易日，跳過本次監控")
+    if not is_trading_day(dl, today_str, is_after_close):
+        write_log(f"今天 {today_str} 判斷為非交易日，結束本次執行")
         return
 
     write_log("通過交易日檢查，開始處理股票資料...")
 
-    is_yesterday_push = (now.hour == 13 and 31 <= now.minute < 59)
-    is_today_push = (now.hour >= 14)
+    # ==================== 原有推播時間判斷 ====================
+    is_yesterday_push = (hour == 13 and 31 <= minute < 59)
+    is_today_push = (hour >= 14)
 
     for stock_id in STOCK_LIST:
         stock_name = STOCK_NAME_MAP.get(stock_id, stock_id)
@@ -453,6 +355,7 @@ async def monitor_stocks():
             write_log(f"{stock_id} 無法取得資料，跳過")
             continue
 
+        # 取得近 61 天收盤價計算均線
         df = dl.taiwan_stock_daily(
             stock_id,
             start_date=(now - timedelta(days=61)).strftime("%Y-%m-%d"),
@@ -473,6 +376,7 @@ async def monitor_stocks():
         change = latest - yesterday_close
         pct = change / yesterday_close * 100 if yesterday_close != 0 else 0
 
+        # 來源註記
         if stock.get("finmind_success", False):
             if stock["source"] == "today_tick_finmind":
                 source_note = f"（{stock['latest_time']}）"
@@ -561,6 +465,5 @@ async def monitor_stocks():
         write_log(f"{stock_id} 盤中推播完成")
 
 
-# 啟動 Bot
 if __name__ == "__main__":
-    bot.run(DISCORD_BOT_TOKEN)
+    main()

@@ -1,8 +1,21 @@
-discord.py
+# 核心套件（Google Sheets 使用）
+requests==2.31.0           # HTTP 請求工具，負責網路溝通
+google-auth==2.27.0        # Google 認證，登入 Google API 用
+google-auth-oauthlib==1.2.0 # Google OAuth 流程，處理授權
+google-auth-httplib2==0.2.0 # Google API HTTP 支援
+google-api-python-client==2.116.0 # Google API 官方 Python 客戶端
+
+# FinMind（取代 yfinance）
+FinMind>=1.2.0             # 台灣股市資料 API，取得股票資訊
+
+# 可選（如果有使用 pandas 或其他資料處理，建議加上）
+pandas>=2.0.0              # 資料處理與分析工具，表格運算
+
+# tqdm：用於顯示進度條，讓長時間運算時能看到進度
+tqdm                       # 進度條顯示，追蹤迴圈或運算進度
+
+# dotenv：用於載入本地 .env 檔案，方便本機開發
 python-dotenv
-pandas
-FinMind
-requests
-yfinance
-google-auth
-google-api-python-client
+
+# 備援股市資料來源（FinMind 失效時用於顯示價格）
+yfinance>=0.2.40
