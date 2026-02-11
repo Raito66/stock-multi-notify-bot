@@ -593,7 +593,6 @@ async def monitor_stocks():
 
     is_after_close = now.hour > 13 or (now.hour == 13 and now.minute >= 30)
 
-    # 修改重點：盤後直接視為交易日，不依賴當天日K資料
     if not is_trading_day(dl, now.strftime("%Y-%m-%d"), is_after_close):
         if is_after_close:
             write_log(f"盤後模式：直接視為交易日（忽略當天日K尚未補齊）")
