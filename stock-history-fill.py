@@ -20,7 +20,7 @@ if not all([GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_ID, FINMIND_TOKEN]):
 
 # ======================== 參數設定 ========================
 STOCK_LIST_SHEET = "股票清單"         # 股票清單分頁（第一分頁）
-HISTORY_SHEET_NAME = "股票清單"       # 歷史資料寫入分頁（與清單同分頁）
+HISTORY_SHEET_NAME = "股票清單"       # 歷史資料寫入分頁（目前與清單同分頁）
 BATCH_DAYS = 30                       # 每次補最近 30 天（可調整）
 MAX_HISTORY_PER_STOCK = 365           # 每支股票最多保留 365 筆（約一年）
 SLEEP_BETWEEN_STOCKS = 90             # 每支股票處理完休息 90 秒（降低記憶體壓力）
@@ -60,9 +60,10 @@ def load_stock_list(service):
         stock_dict = {}
         for row in values:
             if len(row) >= 1:
-                code = row[0].strip()
+                # 強制轉字串 + 補齊 4 位 + 去空白
+                code = str(row[0]).strip().zfill(4)
                 if len(code) == 4 and code.isdigit():
-                    name = row[1].strip() if len(row) > 1 else code
+                    name = row[1].strip() if len(row) > 1 and row[1].strip() else code
                     stock_dict[code] = name
         write_log(f"從 '{STOCK_LIST_SHEET}' 讀到 {len(stock_dict)} 支股票：{list(stock_dict.keys())}")
         return stock_dict
@@ -73,6 +74,7 @@ def load_stock_list(service):
 # 只讀取指定股票的歷史資料（大幅省記憶體）
 def load_history_for_stock(service, stock_id):
     try:
+        stock_id_str = str(stock_id).zfill(4)
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{HISTORY_SHEET_NAME}'!A2:H"
@@ -80,9 +82,9 @@ def load_history_for_stock(service, stock_id):
         values = result.get("values", [])
         history = []
         for row in values:
-            if len(row) >= 4 and row[0] == stock_id:
+            if len(row) >= 4 and str(row[0]).strip() == stock_id_str:
                 try:
-                    price = float(row[3]) if row[3] else None
+                    price = float(row[3]) if row[3] and row[3] != '' else None
                 except:
                     price = None
                 history.append({
@@ -94,7 +96,7 @@ def load_history_for_stock(service, stock_id):
                     "ma60": row[6] if len(row) > 6 else None,
                     "timestamp": row[7] if len(row) > 7 else row[2]
                 })
-        write_log(f"{stock_id} 讀到 {len(history)} 筆歷史資料")
+        write_log(f"{stock_id_str} 讀到 {len(history)} 筆歷史資料")
         return history
     except Exception as e:
         write_log(f"讀取 {stock_id} 歷史失敗：{e}")
@@ -103,32 +105,33 @@ def load_history_for_stock(service, stock_id):
 # 更新或新增單一列（8 欄對應標題）
 def update_or_append_row(service, stock_id, date, stock_name, price, ma5, ma20, ma60, timestamp):
     try:
+        stock_id_str = str(stock_id).zfill(4)
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{HISTORY_SHEET_NAME}'!A2:H"
         ).execute()
         values = result.get("values", [])
         for idx, row in enumerate(values):
-            if len(row) > 2 and row[0] == stock_id and row[2] == date:
+            if len(row) > 2 and str(row[0]).strip() == stock_id_str and row[2] == date:
                 update_range = f"'{HISTORY_SHEET_NAME}'!A{idx+2}:H{idx+2}"
-                update_values = [[stock_id, stock_name, date, price, ma5, ma20, ma60, timestamp]]
+                update_values = [[stock_id_str, stock_name, date, price, ma5, ma20, ma60, timestamp]]
                 service.spreadsheets().values().update(
                     spreadsheetId=GOOGLE_SHEET_ID,
                     range=update_range,
                     valueInputOption="USER_ENTERED",
                     body={"values": update_values}
                 ).execute()
-                write_log(f"{stock_id} 覆蓋成功：{date}")
+                write_log(f"{stock_id_str} 覆蓋成功：{date}")
                 return True
         # 沒找到就新增（8 欄）
-        values = [[stock_id, stock_name, date, price, ma5, ma20, ma60, timestamp]]
+        values = [[stock_id_str, stock_name, date, price, ma5, ma20, ma60, timestamp]]
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{HISTORY_SHEET_NAME}'!A2",
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
-        write_log(f"{stock_id} 新增成功：{date}")
+        write_log(f"{stock_id_str} 新增成功：{date}")
         return True
     except Exception as e:
         write_log(f"{stock_id} 更新/新增失敗：{e}")
@@ -142,21 +145,21 @@ def calculate_ma(prices, window):
 # 清理舊資料，只保留最新 limit 筆（預設 365）
 def trim_history_to_limit(service, stock_id, limit=365):
     try:
+        stock_id_str = str(stock_id).zfill(4)
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{HISTORY_SHEET_NAME}'!A2:H"
         ).execute()
         values = result.get("values", [])
-        stock_rows = [(i+2, row) for i, row in enumerate(values) if len(row) >= 4 and row[0] == stock_id]
+        stock_rows = [(i+2, row) for i, row in enumerate(values) if len(row) >= 4 and str(row[0]).strip() == stock_id_str]
         if len(stock_rows) <= limit:
-            write_log(f"{stock_id} 目前 {len(stock_rows)} 筆，無需清理（上限 {limit}）")
+            write_log(f"{stock_id_str} 目前 {len(stock_rows)} 筆，無需清理（上限 {limit}）")
             return
         # 保留最新的 limit 筆
         keep_rows = stock_rows[-limit:]
-        keep_dates = {row[2] for _, row in keep_rows}
         # 保留非該股票的資料 + 該股票最新 limit 筆
         new_values = [row for _, row in keep_rows] + \
-                     [row for row in values if len(row) < 4 or row[0] != stock_id]
+                     [row for row in values if len(row) < 4 or str(row[0]).strip() != stock_id_str]
         # 清空範圍後重新寫入
         service.spreadsheets().values().clear(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -170,7 +173,7 @@ def trim_history_to_limit(service, stock_id, limit=365):
                 valueInputOption="USER_ENTERED",
                 body={"values": new_values}
             ).execute()
-        write_log(f"{stock_id} 清理完成，保留最新 {len(keep_rows)} 筆（上限 {limit}）")
+        write_log(f"{stock_id_str} 清理完成，保留最新 {len(keep_rows)} 筆（上限 {limit}）")
     except Exception as e:
         write_log(f"{stock_id} 清理失敗：{e}")
 
