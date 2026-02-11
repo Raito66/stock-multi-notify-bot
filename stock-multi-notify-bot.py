@@ -23,14 +23,23 @@ FINMIND_TOKEN = os.getenv("FINMIND_TOKEN")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
+# 從 .env 讀取管理員 Discord ID
+DISCORD_ADMIN_ID = os.getenv("DISCORD_ADMIN_ID")
+if not DISCORD_ADMIN_ID:
+    raise RuntimeError("缺少 DISCORD_ADMIN_ID 環境變數，請在 .env 裡設定")
+
+try:
+    ADMIN_ID = int(DISCORD_ADMIN_ID)
+except ValueError:
+    raise RuntimeError("DISCORD_ADMIN_ID 必須是數字")
+
 if not all([GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_ID, FINMIND_TOKEN, DISCORD_BOT_TOKEN]):
     raise RuntimeError("缺少必要的環境變數")
 
 # ======================== 參數設定 ========================
-SHEET_NAME = "股票清單"          # 正式清單分頁名稱（用來顯示 log）
-SHEET_INDEX = 0                   # 分頁索引（0 = 第一個分頁，改成你的實際索引）
-REQUEST_SHEET_NAME = "申請清單"
-MONITOR_INTERVAL_MINUTES = 5
+STOCK_LIST_SHEET = "股票清單"          # 股票代碼與名稱清單分頁
+REQUEST_SHEET = "申請清單"             # 申請記錄分頁
+MONITOR_INTERVAL_MINUTES = 5           # 每幾分鐘檢查一次
 
 # ======================== Discord Bot 設定 ========================
 intents = discord.Intents.default()
@@ -54,18 +63,13 @@ def get_sheets_service():
         return None
 
 
-def get_stock_info_from_sheets(service, spreadsheet_id, sheet_index=SHEET_INDEX):
+def get_current_stock_list(service):
     try:
-        # 使用分頁索引（0 = 第一個分頁）避免中文名稱問題
-        sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheet_name = sheet_metadata['sheets'][sheet_index]['properties']['title']
-        range_name = f"'{sheet_name}'!A2:B"
-
+        range_name = f"'{STOCK_LIST_SHEET}'!A2:B"
         result = service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id,
+            spreadsheetId=GOOGLE_SHEET_ID,
             range=range_name
         ).execute()
-
         values = result.get('values', [])
         stock_dict = {}
         for row in values:
@@ -74,41 +78,107 @@ def get_stock_info_from_sheets(service, spreadsheet_id, sheet_index=SHEET_INDEX)
                 if len(code) == 4 and code.isdigit():
                     name = row[1].strip() if len(row) > 1 and row[1].strip() else code
                     stock_dict[code] = name
-
-        if not stock_dict:
-            print("未讀到股票資料，使用預設清單")
-            return {
-                "2330": "台積電", "6770": "力積電", "3481": "群創",
-                "2337": "旺宏", "2344": "華邦電", "2409": "友達", "2367": "燿華"
-            }
-
-        print(f"從 Google Sheets 分頁 '{sheet_name}' 讀到 {len(stock_dict)} 支股票：{list(stock_dict.keys())}")
+        print(f"從 '{STOCK_LIST_SHEET}' 讀到 {len(stock_dict)} 支股票")
         return stock_dict
-
     except Exception as e:
-        print(f"讀取股票資訊失敗：{e}")
-        return {
-            "2330": "台積電", "6770": "力積電", "3481": "群創",
-            "2337": "旺宏", "2344": "華邦電", "2409": "友達", "2367": "燿華"
-        }
+        print(f"讀取股票清單失敗：{e}")
+        return {}
 
 
-def append_request_to_sheets(service, action, stock_id, stock_name="", requester=""):
+def add_stock_to_list(service, stock_id, stock_name):
+    try:
+        values = [[stock_id, stock_name]]
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"'{STOCK_LIST_SHEET}'!A2",
+            valueInputOption="USER_ENTERED",
+            body={"values": values}
+        ).execute()
+        print(f"已自動新增股票到清單：{stock_id} {stock_name}")
+        return True
+    except Exception as e:
+        print(f"新增股票到清單失敗：{e}")
+        return False
+
+
+def remove_stock_from_list(service, stock_id):
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"'{STOCK_LIST_SHEET}'!A2:A"
+        ).execute()
+        values = result.get('values', [])
+        rows_to_delete = []
+        for idx, row in enumerate(values):
+            if len(row) > 0 and row[0].strip() == stock_id:
+                rows_to_delete.append(idx + 2)
+
+        if not rows_to_delete:
+            print(f"{stock_id} 在清單中不存在，無需刪除")
+            return True
+
+        for row_idx in sorted(rows_to_delete, reverse=True):
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                body={
+                    "requests": [{
+                        "deleteDimension": {
+                            "range": {
+                                "sheetId": 0,
+                                "dimension": "ROWS",
+                                "startIndex": row_idx - 1,
+                                "endIndex": row_idx
+                            }
+                        }
+                    }]
+                }
+            ).execute()
+            print(f"已刪除 {stock_id} 第 {row_idx} 列")
+
+        print(f"{stock_id} 已從股票清單移除，共刪除 {len(rows_to_delete)} 筆")
+        return True
+    except Exception as e:
+        print(f"移除 {stock_id} 失敗：{e}")
+        return False
+
+
+def append_request_to_sheets(service, action, stock_id, stock_name="", requester="", status="待審核", note=""):
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    values = [[now_str, requester, action, stock_id, stock_name, "待審核", ""]]
+    values = [[now_str, requester, action, stock_id, stock_name, status, note]]
 
     try:
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{REQUEST_SHEET_NAME}!A:G",
+            range=f"{REQUEST_SHEET}!A:G",
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
-        print(f"申請已寫入：{action} {stock_id}")
+        print(f"申請記錄已寫入：{action} {stock_id} 狀態：{status}")
         return True
     except Exception as e:
-        print(f"寫入申請失敗：{e}")
+        print(f"寫入申請記錄失敗：{e}")
         return False
+
+
+# ======================== 管理員通知函式 ========================
+async def notify_admin(action, stock_id, stock_name, requester, note=""):
+    admin = bot.get_user(ADMIN_ID)
+    if admin:
+        try:
+            await admin.send(
+                f"【新申請】\n"
+                f"申請者：{requester}\n"
+                f"動作：{action}\n"
+                f"股票：{stock_id} {stock_name}\n"
+                f"時間：{datetime.now(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"備註：{note}\n"
+                f"請到 Sheets 審核：https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/edit#gid=0"
+            )
+            print(f"已私訊通知管理員：{action} {stock_id}")
+        except Exception as e:
+            print(f"私訊管理員失敗：{e}")
+    else:
+        print("找不到管理員使用者，無法私訊通知")
 
 
 # ======================== Discord 指令 ========================
@@ -116,6 +186,10 @@ def append_request_to_sheets(service, action, stock_id, stock_name="", requester
 async def on_ready():
     print(f"機器人已上線：{bot.user}")
     monitor_stocks.start()
+
+
+def is_admin(ctx):
+    return ctx.author.id == ADMIN_ID
 
 
 @bot.command(name="新增股票")
@@ -127,16 +201,24 @@ async def add_stock(ctx, stock_id: str, *, stock_name: str = ""):
         return
 
     requester = f"{ctx.author} ({ctx.author.id})"
+    service = get_sheets_service()
+    if not service:
+        await ctx.send("無法連線 Google Sheets，申請失敗")
+        return
+
     success = append_request_to_sheets(
-        get_sheets_service(),
+        service,
         "新增",
         stock_id,
-        stock_name.strip(),
-        requester
+        stock_name.strip() or stock_id,
+        requester,
+        status="待審核",
+        note=""
     )
 
     if success:
         await ctx.send(f"已收到申請：新增 **{stock_id}** {stock_name}\n請等待管理員審核。")
+        await notify_admin("新增", stock_id, stock_name, requester)
     else:
         await ctx.send("申請失敗，請稍後再試或聯絡管理員。")
 
@@ -150,18 +232,93 @@ async def remove_stock(ctx, stock_id: str):
         return
 
     requester = f"{ctx.author} ({ctx.author.id})"
+    service = get_sheets_service()
+    if not service:
+        await ctx.send("無法連線 Google Sheets，申請失敗")
+        return
+
     success = append_request_to_sheets(
-        get_sheets_service(),
+        service,
         "移除",
         stock_id,
         "",
-        requester
+        requester,
+        status="待審核",
+        note=""
     )
 
     if success:
         await ctx.send(f"已收到申請：移除 **{stock_id}**\n請等待管理員審核。")
+        await notify_admin("移除", stock_id, "", requester)
     else:
         await ctx.send("申請失敗，請稍後再試或聯絡管理員。")
+
+
+# ======================== 管理員專屬指令 ========================
+@bot.command(name="審核新增")
+@commands.check(is_admin)
+async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
+    stock_id = stock_id.strip()
+    if not (stock_id.isdigit() and len(stock_id) == 4):
+        await ctx.send("股票代碼必須是 4 位數字")
+        return
+
+    service = get_sheets_service()
+    if not service:
+        await ctx.send("無法連線 Google Sheets")
+        return
+
+    success = add_stock_to_list(service, stock_id, stock_name.strip() or stock_id)
+    if success:
+        await ctx.send(f"已審核通過：新增 **{stock_id}** {stock_name} 到股票清單")
+    else:
+        await ctx.send("新增失敗，請檢查 Sheets 權限")
+
+
+@bot.command(name="審核移除")
+@commands.check(is_admin)
+async def approve_remove(ctx, stock_id: str):
+    stock_id = stock_id.strip()
+    if not (stock_id.isdigit() and len(stock_id) == 4):
+        await ctx.send("股票代碼必須是 4 位數字")
+        return
+
+    service = get_sheets_service()
+    if not service:
+        await ctx.send("無法連線 Google Sheets")
+        return
+
+    success = remove_stock_from_list(service, stock_id)
+    if success:
+        await ctx.send(f"已審核通過：移除 **{stock_id}** 從股票清單")
+    else:
+        await ctx.send("移除失敗，請檢查 Sheets 權限")
+
+
+@bot.command(name="拒絕申請")
+@commands.check(is_admin)
+async def reject_request(ctx, request_row: int, *, reason: str = "未說明原因"):
+    if request_row < 2:
+        await ctx.send("申請編號從 2 開始（第 2 列為第一筆申請）")
+        return
+
+    service = get_sheets_service()
+    if not service:
+        await ctx.send("無法連線 Google Sheets")
+        return
+
+    try:
+        update_range = f"{REQUEST_SHEET}!F{request_row}:G{request_row}"
+        update_values = [["已拒絕", reason]]
+        service.spreadsheets().values().update(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=update_range,
+            valueInputOption="USER_ENTERED",
+            body={"values": update_values}
+        ).execute()
+        await ctx.send(f"已拒絕申請編號 {request_row}，原因：{reason}")
+    except Exception as e:
+        await ctx.send(f"拒絕申請失敗：{e}")
 
 
 # ======================== 工具函式 ========================
@@ -190,15 +347,8 @@ def send_discord_push(message: str):
 def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> bool:
     symbol_for_check = "2330"
     try:
-        if is_after_close:
-            df = dl.taiwan_stock_daily(symbol_for_check, start_date=check_date, end_date=check_date)
-            if not df.empty:
-                write_log(f"盤後檢查：{check_date} 有日K資料，視為交易日")
-                return True
-            else:
-                write_log(f"盤後檢查：{check_date} 無日K資料，視為非交易日")
-                return False
-        else:
+        # 盤中：檢查昨天是否有資料
+        if not is_after_close:
             yesterday = (datetime.strptime(check_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
             df = dl.taiwan_stock_daily(symbol_for_check, start_date=yesterday, end_date=yesterday)
             if not df.empty:
@@ -207,6 +357,12 @@ def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> boo
             else:
                 write_log(f"盤中檢查：{yesterday} 無交易資料，今天很可能休市")
                 return False
+
+        # 盤後：不再依賴當天日K資料，直接視為交易日（解決盤後早期無資料問題）
+        else:
+            write_log(f"盤後模式：直接視為交易日，不檢查當天日K")
+            return True
+
     except Exception as e:
         write_log(f"交易日檢查發生錯誤：{e}，預設為非交易日")
         return False
@@ -348,7 +504,7 @@ def save_to_sheets(service, stock_id, stock_name, date, price, ma5, ma20, ma60, 
         values = [[stock_id, stock_name, date, price, ma5, ma20, ma60, timestamp]]
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{SHEET_NAME}!A2",
+            range=f"{STOCK_LIST_SHEET}!A2",
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
@@ -425,7 +581,7 @@ async def monitor_stocks():
     if not service:
         return
 
-    STOCK_NAME_MAP = get_stock_info_from_sheets(service, GOOGLE_SHEET_ID)
+    STOCK_NAME_MAP = get_current_stock_list(service)
     STOCK_LIST = list(STOCK_NAME_MAP.keys())
 
     dl = DataLoader()
@@ -437,9 +593,13 @@ async def monitor_stocks():
 
     is_after_close = now.hour > 13 or (now.hour == 13 and now.minute >= 30)
 
+    # 修改重點：盤後直接視為交易日，不依賴當天日K資料
     if not is_trading_day(dl, now.strftime("%Y-%m-%d"), is_after_close):
-        write_log(f"今天非交易日，跳過本次監控")
-        return
+        if is_after_close:
+            write_log(f"盤後模式：直接視為交易日（忽略當天日K尚未補齊）")
+        else:
+            write_log(f"今天非交易日，跳過本次監控")
+            return
 
     write_log("通過交易日檢查，開始處理股票資料...")
 
@@ -508,26 +668,26 @@ async def monitor_stocks():
         if is_today_push and stock["is_after_close"]:
             close_price_for_sheet = get_today_close(dl, stock_id, stock["date"])
             if close_price_for_sheet is None:
-                write_log(f"{stock_id} 盤後寫入：FinMind 當天日K尚未有資料，跳過寫入")
+                write_log(f"{stock_id} 盤後寫入：FinMind 當天日K尚未有資料，使用最新價代替")
                 close_price = stock["latest_price"]
-                close_note = f"{stock['latest_time']} （當前最新價）"
+                close_note = f"{stock['latest_time']} （盤後暫用最新價，等待日K補齊）"
             else:
                 close_price = close_price_for_sheet
                 close_note = f"{stock['latest_time']} （日K正式收盤）"
 
             msg = [
                 f"---",
-                f"【{stock_id} {stock_name} 價格監控 {now.strftime('%Y年%m月%d日')}】",
+                f"【{stock_id} {stock_name} 盤後監控 {now.strftime('%Y年%m月%d日')}】",
                 f"時間：{now_str}",
                 "━━━━━━━━━━━━━━",
-                f"最新價：{latest:.2f} 元{source_note}",
+                f"最新價：{stock['latest_price']:.2f} 元{source_note}",
                 f"昨收：{yesterday_close:.2f} 元",
                 f"漲跌：{change:+.2f}（{pct:+.2f}%）",
                 f"5日均線：{ma5_str}",
                 f"20日均線：{ma20_str}",
                 f"60日均線：{ma60_str}",
                 f"今日收盤：{close_price:.2f} 元{close_note}",
-                f"行情摘要：{get_after_close_summary(latest, ma5, ma20, ma60, change)}",
+                f"行情摘要：{get_after_close_summary(stock['latest_price'], ma5, ma20, ma60, change)}",
                 footnote
             ]
 
