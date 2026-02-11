@@ -74,7 +74,7 @@ def get_current_stock_list(service):
         stock_dict = {}
         for row in values:
             if len(row) >= 1:
-                code = row[0].strip()
+                code = str(row[0]).strip()  # 強制轉字串
                 if len(code) == 4 and code.isdigit():
                     name = row[1].strip() if len(row) > 1 and row[1].strip() else code
                     stock_dict[code] = name
@@ -87,14 +87,16 @@ def get_current_stock_list(service):
 
 def add_stock_to_list(service, stock_id, stock_name):
     try:
-        values = [[stock_id, stock_name]]
+        stock_id_str = str(stock_id).zfill(4)
+        values = [[stock_id_str, stock_name.strip() or stock_id_str]]
+
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{STOCK_LIST_SHEET}'!A2",
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
-        print(f"已自動新增股票到清單：{stock_id} {stock_name}")
+        print(f"已新增股票到清單：{stock_id_str} {stock_name}")
         return True
     except Exception as e:
         print(f"新增股票到清單失敗：{e}")
@@ -103,6 +105,7 @@ def add_stock_to_list(service, stock_id, stock_name):
 
 def remove_stock_from_list(service, stock_id):
     try:
+        stock_id_str = str(stock_id).zfill(4)
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{STOCK_LIST_SHEET}'!A2:A"
@@ -110,11 +113,11 @@ def remove_stock_from_list(service, stock_id):
         values = result.get('values', [])
         rows_to_delete = []
         for idx, row in enumerate(values):
-            if len(row) > 0 and row[0].strip() == stock_id:
+            if len(row) > 0 and str(row[0]).strip() == stock_id_str:
                 rows_to_delete.append(idx + 2)
 
         if not rows_to_delete:
-            print(f"{stock_id} 在清單中不存在，無需刪除")
+            print(f"{stock_id_str} 在清單中不存在，無需刪除")
             return True
 
         for row_idx in sorted(rows_to_delete, reverse=True):
@@ -133,9 +136,9 @@ def remove_stock_from_list(service, stock_id):
                     }]
                 }
             ).execute()
-            print(f"已刪除 {stock_id} 第 {row_idx} 列")
+            print(f"已刪除 {stock_id_str} 第 {row_idx} 列")
 
-        print(f"{stock_id} 已從股票清單移除，共刪除 {len(rows_to_delete)} 筆")
+        print(f"{stock_id_str} 已從股票清單移除，共刪除 {len(rows_to_delete)} 筆")
         return True
     except Exception as e:
         print(f"移除 {stock_id} 失敗：{e}")
@@ -144,7 +147,8 @@ def remove_stock_from_list(service, stock_id):
 
 def append_request_to_sheets(service, action, stock_id, stock_name="", requester="", status="待審核", note=""):
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    values = [[now_str, requester, action, stock_id, stock_name, status, note]]
+    stock_id_str = str(stock_id).zfill(4)  # 強制保留前導零
+    values = [[now_str, requester, action, stock_id_str, stock_name, status, note]]
 
     try:
         service.spreadsheets().values().append(
@@ -153,7 +157,7 @@ def append_request_to_sheets(service, action, stock_id, stock_name="", requester
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
-        print(f"申請記錄已寫入：{action} {stock_id} 狀態：{status}")
+        print(f"申請記錄已寫入：{action} {stock_id_str} 狀態：{status}")
         return True
     except Exception as e:
         print(f"寫入申請記錄失敗：{e}")
@@ -197,7 +201,7 @@ def is_admin(ctx):
 async def add_stock(ctx, stock_id: str, *, stock_name: str = ""):
     stock_id = stock_id.strip()
     if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字，例如 2330")
+        await ctx.send("股票代碼必須是 4 位數字，例如 2330 或 0050")
         return
 
     requester = f"{ctx.author} ({ctx.author.id})"
@@ -260,7 +264,7 @@ async def remove_stock(ctx, stock_id: str):
 async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
     stock_id = stock_id.strip()
     if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字")
+        await ctx.send("股票代碼必須是 4 位數字，例如 0050 或 2330")
         return
 
     service = get_sheets_service()
@@ -268,11 +272,48 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    success = add_stock_to_list(service, stock_id, stock_name.strip() or stock_id)
-    if success:
-        await ctx.send(f"已審核通過：新增 **{stock_id}** {stock_name} 到股票清單")
-    else:
-        await ctx.send("新增失敗，請檢查 Sheets 權限")
+    stock_id_str = stock_id.zfill(4)
+    success_add = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
+
+    if not success_add:
+        await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗，請檢查 Google Sheets 權限")
+        return
+
+    # 更新所有符合條件的申請記錄為「已通過」
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"'{REQUEST_SHEET}'!A:G"
+        ).execute()
+        values = result.get('values', [])
+
+        updated_count = 0
+        for idx, row in enumerate(values):
+            if len(row) >= 5 and row[2] == "新增" and str(row[3]).strip() == stock_id_str:
+                row_num = idx + 2
+                update_range = f"{REQUEST_SHEET}!F{row_num}:G{row_num}"
+                update_values = [["已通過", "管理員已審核通過"]]
+                service.spreadsheets().values().update(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    range=update_range,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": update_values}
+                ).execute()
+                updated_count += 1
+
+        if updated_count > 0:
+            await ctx.send(
+                f"已審核通過：新增 **{stock_id_str} {stock_name}** 到股票清單\n"
+                f"已更新 {updated_count} 筆申請狀態為「已通過」"
+            )
+        else:
+            await ctx.send(
+                f"已成功新增 **{stock_id_str} {stock_name}** 到股票清單\n"
+                f"但未找到任何對應的「待審核」申請記錄，無需更新狀態"
+            )
+
+    except Exception as e:
+        await ctx.send(f"更新申請狀態時發生錯誤：{e}\n但股票已新增到清單")
 
 
 @bot.command(name="審核移除")
@@ -280,7 +321,7 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
 async def approve_remove(ctx, stock_id: str):
     stock_id = stock_id.strip()
     if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字")
+        await ctx.send("股票代碼必須是 4 位數字，例如 0050 或 2330")
         return
 
     service = get_sheets_service()
@@ -288,11 +329,42 @@ async def approve_remove(ctx, stock_id: str):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    success = remove_stock_from_list(service, stock_id)
-    if success:
-        await ctx.send(f"已審核通過：移除 **{stock_id}** 從股票清單")
-    else:
-        await ctx.send("移除失敗，請檢查 Sheets 權限")
+    stock_id_str = stock_id.zfill(4)
+    success = remove_stock_from_list(service, stock_id_str)
+
+    if not success:
+        await ctx.send(f"移除 **{stock_id_str}** 失敗，請檢查 Google Sheets 權限")
+        return
+
+    # 更新所有符合條件的申請記錄為「已通過」
+    try:
+        result = service.spreadsheets().values().get(
+            spreadsheetId=GOOGLE_SHEET_ID,
+            range=f"'{REQUEST_SHEET}'!A:G"
+        ).execute()
+        values = result.get('values', [])
+
+        updated_count = 0
+        for idx, row in enumerate(values):
+            if len(row) >= 5 and row[2] == "移除" and str(row[3]).strip() == stock_id_str:
+                row_num = idx + 2
+                update_range = f"{REQUEST_SHEET}!F{row_num}:G{row_num}"
+                update_values = [["已通過", "管理員已審核通過"]]
+                service.spreadsheets().values().update(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    range=update_range,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": update_values}
+                ).execute()
+                updated_count += 1
+
+        if updated_count > 0:
+            await ctx.send(f"已審核通過：移除 **{stock_id_str}** 從股票清單\n已更新 {updated_count} 筆申請狀態為「已通過」")
+        else:
+            await ctx.send(f"已成功移除 **{stock_id_str}**\n未找到對應申請記錄，無需更新狀態")
+
+    except Exception as e:
+        await ctx.send(f"更新申請狀態失敗：{e}\n但股票已移除")
 
 
 @bot.command(name="拒絕申請")
@@ -347,7 +419,6 @@ def send_discord_push(message: str):
 def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> bool:
     symbol_for_check = "2330"
     try:
-        # 盤中：檢查昨天是否有資料
         if not is_after_close:
             yesterday = (datetime.strptime(check_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
             df = dl.taiwan_stock_daily(symbol_for_check, start_date=yesterday, end_date=yesterday)
@@ -357,12 +428,9 @@ def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> boo
             else:
                 write_log(f"盤中檢查：{yesterday} 無交易資料，今天很可能休市")
                 return False
-
-        # 盤後：直接視為交易日，不依賴當天日K資料
         else:
             write_log(f"盤後模式：直接視為交易日（忽略當天日K尚未補齊）")
             return True
-
     except Exception as e:
         write_log(f"交易日檢查發生錯誤：{e}，預設為非交易日")
         return False
@@ -495,24 +563,6 @@ def calculate_ma(prices, window):
     if len(prices) < window:
         return None
     return pd.Series(prices).rolling(window).mean().iloc[-1]
-
-
-def save_to_sheets(service, stock_id, stock_name, date, price, ma5, ma20, ma60, timestamp):
-    if not service:
-        return False
-    try:
-        values = [[stock_id, stock_name, date, price, ma5, ma20, ma60, timestamp]]
-        service.spreadsheets().values().append(
-            spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{STOCK_LIST_SHEET}!A2",
-            valueInputOption="USER_ENTERED",
-            body={"values": values}
-        ).execute()
-        write_log(f"{stock_id} 寫入 Sheets 成功：{date} - {price:.2f}")
-        return True
-    except Exception as e:
-        write_log(f"{stock_id} 寫入 Sheets 失敗：{e}")
-        return False
 
 
 def get_intraday_advice(latest, ma5, ma20, ma60, pct):
@@ -690,11 +740,8 @@ async def monitor_stocks():
                 footnote
             ]
 
-            if close_price_for_sheet is not None:
-                save_to_sheets(
-                    service, stock_id, stock_name, stock["date"],
-                    close_price_for_sheet, ma5, ma20, ma60, now_str
-                )
+            # 已移除 save_to_sheets 呼叫，避免搞亂股票清單分頁
+            # 歷史資料應由 stock-history-fill.py 負責補齊
 
             send_discord_push("\n".join(msg))
             write_log(f"{stock_id} 推播盤後資訊完成")
