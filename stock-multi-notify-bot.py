@@ -38,8 +38,8 @@ if not all([GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_ID, FINMIND_TOKEN, DISCORD_B
     raise RuntimeError("缺少必要的環境變數")
 
 # ======================== 參數設定 ========================
-STOCK_LIST_SHEET = "股票清單"          # 股票代碼與名稱清單分頁
-REQUEST_SHEET = "申請清單"             # 申請記錄分頁
+STOCK_LIST_SHEET = "股票清單"          # 請確認這與你的分頁名稱完全一樣
+REQUEST_SHEET = "申請清單"             # 請確認這與你的分頁名稱完全一樣
 MONITOR_INTERVAL_MINUTES = 5           # 維持 5 分鐘
 
 # ======================== Discord Bot 設定 ========================
@@ -95,15 +95,15 @@ def add_stock_to_list(service, stock_id, stock_name):
             spreadsheetId=GOOGLE_SHEET_ID,
             range=f"'{STOCK_LIST_SHEET}'!A:B",
             valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",  # 插入新列，而不是一直append到最底
+            insertDataOption="INSERT_ROWS",  # 插入新列，會加在 A2 下面
             body={"values": values}
         ).execute()
 
-        print(f"寫入成功：{stock_id_str} {stock_name}，回應：{response}")
+        print(f"寫入股票清單成功：{stock_id_str} {stock_name}，回應：{response}")
         return True, "寫入成功，已插入到股票清單分頁"
     except Exception as e:
         error_msg = str(e)
-        print(f"寫入失敗：{stock_id_str} {stock_name} → {error_msg}")
+        print(f"寫入股票清單失敗：{stock_id_str} {stock_name} → {error_msg}")
         return False, error_msg
 
 
@@ -281,16 +281,16 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    # 嘗試寫入股票清單，並取得詳細結果
-    success_add, msg = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
+    # 1. 嘗試寫入股票清單，並取得詳細結果
+    success_add, add_msg = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
 
-    if success_add:
-        await ctx.send(f"**已審核通過**：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n{msg}")
-    else:
-        await ctx.send(f"新增 **{stock_id_str}** 到股票清單**失敗**：{msg}\n請檢查 Google Sheets 權限、分頁名稱，或查看 Heroku log")
+    if not success_add:
+        await ctx.send(f"新增 **{stock_id_str}** 到股票清單 **失敗**：\n{add_msg}\n請檢查 Heroku log 或 Google Sheets 權限")
         return
 
-    # 如果寫入成功，再更新申請清單狀態
+    await ctx.send(f"**已寫入股票清單**：**{stock_id_str} {stock_name.strip() or stock_id_str}**\n{add_msg}")
+
+    # 2. 更新所有符合「新增」且「待審核」的申請記錄為已通過
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -298,8 +298,8 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         ).execute()
         values = result.get('values', [])
 
-        latest_row_num = None
-        latest_time = None
+        updated_count = 0
+        updated_rows = []
 
         for idx, row in enumerate(values):
             if len(row) < 6:
@@ -310,26 +310,28 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
             status_raw = row[5] if len(row) > 5 else None
             status = str(status_raw).strip() if status_raw is not None else ""
 
-            if action == "新增" and code == stock_id_str and status == "待審核":
-                request_time = str(row[0]).strip() if row[0] else ""
-                if latest_time is None or (request_time and request_time > latest_time):
-                    latest_time = request_time
-                    latest_row_num = idx + 2
+            # 放寬比對：只要包含「待審核」就更新
+            if action == "新增" and code == stock_id_str and "待審核" in status:
+                row_num = idx + 2
+                update_range = f"{REQUEST_SHEET}!F{row_num}:G{row_num}"
+                update_values = [["已通過", "管理員已審核通過"]]
 
-        if latest_row_num is not None:
-            update_range = f"{REQUEST_SHEET}!F{latest_row_num}:G{latest_row_num}"
-            update_values = [["已通過", "管理員已審核通過"]]
+                service.spreadsheets().values().update(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    range=update_range,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": update_values}
+                ).execute()
 
-            service.spreadsheets().values().update(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                range=update_range,
-                valueInputOption="USER_ENTERED",
-                body={"values": update_values}
-            ).execute()
+                updated_count += 1
+                request_time = str(row[0]).strip() if row[0] else "未知時間"
+                updated_rows.append(f"第 {row_num} 列，時間：{request_time}")
 
-            await ctx.send(f"已更新申請時間 {latest_time} 的記錄為「已通過」")
+        if updated_count > 0:
+            rows_str = "\n".join(updated_rows)
+            await ctx.send(f"已更新 **{updated_count} 筆** 待審核申請為「已通過」\n{rows_str}")
         else:
-            await ctx.send("已新增到清單，但未找到對應的待審核申請，狀態未更新，請手動檢查")
+            await ctx.send("已寫入股票清單，但未找到任何「待審核」的對應申請記錄，狀態未更新，請手動檢查申請清單分頁")
 
     except Exception as e:
         await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已加入清單（若成功）")
@@ -361,6 +363,7 @@ async def approve_remove(ctx, stock_id: str):
         await ctx.send(f"移除 **{stock_id_str}** 失敗：{msg}")
         return
 
+    # 更新申請狀態（類似新增的邏輯）
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -368,8 +371,8 @@ async def approve_remove(ctx, stock_id: str):
         ).execute()
         values = result.get('values', [])
 
-        latest_row_num = None
-        latest_time = None
+        updated_count = 0
+        updated_rows = []
 
         for idx, row in enumerate(values):
             if len(row) < 6:
@@ -380,26 +383,27 @@ async def approve_remove(ctx, stock_id: str):
             status_raw = row[5] if len(row) > 5 else None
             status = str(status_raw).strip() if status_raw is not None else ""
 
-            if action == "移除" and code == stock_id_str and status == "待審核":
-                request_time = str(row[0]).strip() if row[0] else ""
-                if latest_time is None or (request_time and request_time > latest_time):
-                    latest_time = request_time
-                    latest_row_num = idx + 2
+            if action == "移除" and code == stock_id_str and "待審核" in status:
+                row_num = idx + 2
+                update_range = f"{REQUEST_SHEET}!F{row_num}:G{row_num}"
+                update_values = [["已通過", "管理員已審核通過"]]
 
-        if latest_row_num is not None:
-            update_range = f"{REQUEST_SHEET}!F{latest_row_num}:G{latest_row_num}"
-            update_values = [["已通過", "管理員已審核通過"]]
+                service.spreadsheets().values().update(
+                    spreadsheetId=GOOGLE_SHEET_ID,
+                    range=update_range,
+                    valueInputOption="USER_ENTERED",
+                    body={"values": update_values}
+                ).execute()
 
-            service.spreadsheets().values().update(
-                spreadsheetId=GOOGLE_SHEET_ID,
-                range=update_range,
-                valueInputOption="USER_ENTERED",
-                body={"values": update_values}
-            ).execute()
+                updated_count += 1
+                request_time = str(row[0]).strip() if row[0] else "未知時間"
+                updated_rows.append(f"第 {row_num} 列，時間：{request_time}")
 
-            await ctx.send(f"已更新申請時間 {latest_time} 的記錄為「已通過」")
+        if updated_count > 0:
+            rows_str = "\n".join(updated_rows)
+            await ctx.send(f"已更新 **{updated_count} 筆** 待審核申請為「已通過」\n{rows_str}")
         else:
-            await ctx.send("已移除股票，但未找到對應待審核申請，狀態未更新")
+            await ctx.send("已移除股票，但未找到任何「待審核」的對應申請記錄，狀態未更新")
 
     except Exception as e:
         await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已移除（若成功）")
