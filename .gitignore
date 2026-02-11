@@ -1,35 +1,30 @@
-.idea
 channelaccesstoken.txt
-FinMind token.txt
-heroku帳密.txt
 tsmc-monitor-2a246d265897.json
+FinMind token.txt
+error.log
+heroku帳密.txt
 
-# Python 相關
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
+.venv
 
-# 環境變數與敏感檔案
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 环境变量
 .env
 .env.local
-.env.development.local
-.env.test.local
-.env.production.local
 
-# 日誌與暫存檔
-*.log
-error.log
-
-# Heroku 產生的檔案
-.heroku/
-
-# 其他不必要的
+# 系统文件
 .DS_Store
 Thumbs.db
