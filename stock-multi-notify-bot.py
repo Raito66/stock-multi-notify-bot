@@ -263,8 +263,13 @@ async def remove_stock(ctx, stock_id: str):
 @commands.check(is_admin)
 async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
     stock_id = stock_id.strip()
-    if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字，例如 0050 或 2330")
+    if not stock_id.isdigit():
+        await ctx.send("股票代碼必須是數字")
+        return
+
+    stock_id_str = stock_id.zfill(4)
+    if len(stock_id_str) != 4:
+        await ctx.send("請輸入 4 位以內的股票代碼（會自動補零）")
         return
 
     service = get_sheets_service()
@@ -272,14 +277,14 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    stock_id_str = stock_id.zfill(4)
+    # 先新增到股票清單
     success_add = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
 
     if not success_add:
-        await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗，請檢查 Google Sheets 權限")
+        await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗，請檢查權限")
         return
 
-    # 更新所有符合條件的申請記錄為「已通過」
+    # 讀取申請清單所有資料
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -287,33 +292,50 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         ).execute()
         values = result.get('values', [])
 
-        updated_count = 0
-        for idx, row in enumerate(values):
-            if len(row) >= 5 and row[2] == "新增" and str(row[3]).strip() == stock_id_str:
-                row_num = idx + 2
-                update_range = f"{REQUEST_SHEET}!F{row_num}:G{row_num}"
-                update_values = [["已通過", "管理員已審核通過"]]
-                service.spreadsheets().values().update(
-                    spreadsheetId=GOOGLE_SHEET_ID,
-                    range=update_range,
-                    valueInputOption="USER_ENTERED",
-                    body={"values": update_values}
-                ).execute()
-                updated_count += 1
+        # 找出最新一筆符合「新增」＋「股票代碼」＋「待審核」的記錄
+        latest_row_num = None
+        latest_time = None
 
-        if updated_count > 0:
+        for idx, row in enumerate(values):
+            if len(row) >= 6:
+                action = row[2]
+                code = str(row[3]).strip()
+                status = row[5] if len(row) > 5 else ""
+                request_time = row[0] if row[0] else ""
+
+                if action == "新增" and code == stock_id_str and status == "待審核":
+                    if latest_time is None or request_time > latest_time:
+                        latest_time = request_time
+                        latest_row_num = idx + 2  # Sheets 從 1 開始，標題佔 1，所以 +2
+
+        if latest_row_num is not None:
+            # 更新最新那筆
+            update_range = f"{REQUEST_SHEET}!F{latest_row_num}:G{latest_row_num}"
+            update_values = [["已通過", "管理員已審核通過"]]
+
+            service.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                range=update_range,
+                valueInputOption="USER_ENTERED",
+                body={"values": update_values}
+            ).execute()
+
             await ctx.send(
-                f"已審核通過：新增 **{stock_id_str} {stock_name}** 到股票清單\n"
-                f"已更新 {updated_count} 筆申請狀態為「已通過」"
+                f"**已審核通過**：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
+                f"已將最新申請（時間：{latest_time}）狀態更新為「已通過」"
             )
         else:
             await ctx.send(
-                f"已成功新增 **{stock_id_str} {stock_name}** 到股票清單\n"
-                f"但未找到任何對應的「待審核」申請記錄，無需更新狀態"
+                f"**已成功新增** **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
+                f"但未找到任何「待審核」的對應申請記錄，狀態未自動更新，請手動檢查「申請清單」分頁"
             )
 
     except Exception as e:
-        await ctx.send(f"更新申請狀態時發生錯誤：{e}\n但股票已新增到清單")
+        write_log(f"審核新增時更新申請狀態失敗：{e}")
+        await ctx.send(
+            f"新增 **{stock_id_str}** 到清單成功，但更新申請狀態時發生錯誤：{str(e)}\n"
+            f"請手動檢查「申請清單」分頁，並將對應記錄改為「已通過」"
+        )
 
 
 @bot.command(name="審核移除")
