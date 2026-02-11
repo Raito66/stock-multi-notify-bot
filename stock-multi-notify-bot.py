@@ -66,7 +66,6 @@ def get_sheets_service():
 
 def get_current_stock_list(service):
     try:
-        # 限制讀取範圍，避免一次讀太多
         range_name = f"'{STOCK_LIST_SHEET}'!A2:B500"
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -88,21 +87,24 @@ def get_current_stock_list(service):
 
 
 def add_stock_to_list(service, stock_id, stock_name):
-    try:
-        stock_id_str = str(stock_id).zfill(4)
-        values = [[stock_id_str, stock_name.strip() or stock_id_str]]
+    stock_id_str = str(stock_id).zfill(4)
+    values = [[stock_id_str, stock_name.strip() or stock_id_str]]
 
-        service.spreadsheets().values().append(
+    try:
+        response = service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"'{STOCK_LIST_SHEET}'!A2",
+            range=f"'{STOCK_LIST_SHEET}'!A:B",
             valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",  # 插入新列，而不是一直append到最底
             body={"values": values}
         ).execute()
-        print(f"已新增股票到清單：{stock_id_str} {stock_name}")
-        return True
+
+        print(f"寫入成功：{stock_id_str} {stock_name}，回應：{response}")
+        return True, "寫入成功，已插入到股票清單分頁"
     except Exception as e:
-        print(f"新增股票到清單失敗：{e}")
-        return False
+        error_msg = str(e)
+        print(f"寫入失敗：{stock_id_str} {stock_name} → {error_msg}")
+        return False, error_msg
 
 
 def remove_stock_from_list(service, stock_id):
@@ -120,7 +122,7 @@ def remove_stock_from_list(service, stock_id):
 
         if not rows_to_delete:
             print(f"{stock_id_str} 在清單中不存在，無需刪除")
-            return True
+            return True, "無需刪除，已存在"
 
         for row_idx in sorted(rows_to_delete, reverse=True):
             service.spreadsheets().batchUpdate(
@@ -141,10 +143,11 @@ def remove_stock_from_list(service, stock_id):
             print(f"已刪除 {stock_id_str} 第 {row_idx} 列")
 
         print(f"{stock_id_str} 已從股票清單移除，共刪除 {len(rows_to_delete)} 筆")
-        return True
+        return True, f"已刪除 {len(rows_to_delete)} 筆"
     except Exception as e:
-        print(f"移除 {stock_id} 失敗：{e}")
-        return False
+        error_msg = str(e)
+        print(f"移除失敗：{error_msg}")
+        return False, error_msg
 
 
 def append_request_to_sheets(service, action, stock_id, stock_name="", requester="", status="待審核", note=""):
@@ -278,11 +281,16 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    success_add = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
-    if not success_add:
-        await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗")
+    # 嘗試寫入股票清單，並取得詳細結果
+    success_add, msg = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
+
+    if success_add:
+        await ctx.send(f"**已審核通過**：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n{msg}")
+    else:
+        await ctx.send(f"新增 **{stock_id_str}** 到股票清單**失敗**：{msg}\n請檢查 Google Sheets 權限、分頁名稱，或查看 Heroku log")
         return
 
+    # 如果寫入成功，再更新申請清單狀態
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -319,18 +327,12 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
                 body={"values": update_values}
             ).execute()
 
-            await ctx.send(
-                f"已審核通過：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
-                f"已更新申請時間 {latest_time} 的記錄為「已通過」"
-            )
+            await ctx.send(f"已更新申請時間 {latest_time} 的記錄為「已通過」")
         else:
-            await ctx.send(
-                f"已成功新增 **{stock_id_str}** 到股票清單\n"
-                f"但未找到「待審核」的申請記錄，狀態未自動更新，請手動檢查"
-            )
+            await ctx.send("已新增到清單，但未找到對應的待審核申請，狀態未更新，請手動檢查")
 
     except Exception as e:
-        await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已加入清單")
+        await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已加入清單（若成功）")
 
 
 @bot.command(name="審核移除")
@@ -351,9 +353,12 @@ async def approve_remove(ctx, stock_id: str):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    success = remove_stock_from_list(service, stock_id_str)
-    if not success:
-        await ctx.send(f"移除 **{stock_id_str}** 失敗")
+    success_remove, msg = remove_stock_from_list(service, stock_id_str)
+
+    if success_remove:
+        await ctx.send(f"已審核通過：移除 **{stock_id_str}** 從股票清單\n{msg}")
+    else:
+        await ctx.send(f"移除 **{stock_id_str}** 失敗：{msg}")
         return
 
     try:
@@ -392,12 +397,12 @@ async def approve_remove(ctx, stock_id: str):
                 body={"values": update_values}
             ).execute()
 
-            await ctx.send(f"已審核通過：移除 **{stock_id_str}** 從股票清單\n已更新申請時間 {latest_time} 的記錄為「已通過」")
+            await ctx.send(f"已更新申請時間 {latest_time} 的記錄為「已通過」")
         else:
-            await ctx.send(f"已成功移除 **{stock_id_str}**\n未找到對應待審核記錄，狀態未更新")
+            await ctx.send("已移除股票，但未找到對應待審核申請，狀態未更新")
 
     except Exception as e:
-        await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已移除")
+        await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已移除（若成功）")
 
 
 @bot.command(name="拒絕申請")
@@ -690,7 +695,6 @@ async def monitor_stocks():
                 write_log(f"{stock_id} 無法取得資料，跳過")
                 continue
 
-            # 只抓最近 20 天資料，大幅減少記憶體使用
             df = dl.taiwan_stock_daily(
                 stock_id,
                 start_date=(now - timedelta(days=20)).strftime("%Y-%m-%d"),
@@ -703,7 +707,6 @@ async def monitor_stocks():
             ma20 = calculate_ma(closes, 20)
             ma60 = calculate_ma(closes, 60)
 
-            # 立刻釋放 pandas 物件
             del df
             del closes
             gc.collect()
@@ -803,12 +806,10 @@ async def monitor_stocks():
         except Exception as e:
             write_log(f"{stock_id} 處理錯誤：{e}")
         finally:
-            # 每支股票強制回收兩次
             gc.collect()
-            time.sleep(0.3)  # 微小延遲，讓系統有機會釋放
+            time.sleep(0.3)
             gc.collect()
 
-    # 整個循環結束後再回收一次
     del STOCK_NAME_MAP
     del STOCK_LIST
     gc.collect()
