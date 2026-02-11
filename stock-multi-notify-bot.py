@@ -12,6 +12,7 @@ import pandas as pd
 from FinMind.data import DataLoader
 import requests
 import yfinance as yf
+import gc
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -39,7 +40,7 @@ if not all([GOOGLE_SHEETS_CREDENTIALS, GOOGLE_SHEET_ID, FINMIND_TOKEN, DISCORD_B
 # ======================== 參數設定 ========================
 STOCK_LIST_SHEET = "股票清單"          # 股票代碼與名稱清單分頁
 REQUEST_SHEET = "申請清單"             # 申請記錄分頁
-MONITOR_INTERVAL_MINUTES = 5           # 每幾分鐘檢查一次
+MONITOR_INTERVAL_MINUTES = 5           # 維持 5 分鐘
 
 # ======================== Discord Bot 設定 ========================
 intents = discord.Intents.default()
@@ -65,7 +66,8 @@ def get_sheets_service():
 
 def get_current_stock_list(service):
     try:
-        range_name = f"'{STOCK_LIST_SHEET}'!A2:B"
+        # 限制讀取範圍，避免一次讀太多
+        range_name = f"'{STOCK_LIST_SHEET}'!A2:B500"
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
             range=range_name
@@ -74,7 +76,7 @@ def get_current_stock_list(service):
         stock_dict = {}
         for row in values:
             if len(row) >= 1:
-                code = str(row[0]).strip()  # 強制轉字串
+                code = str(row[0]).strip().zfill(4)
                 if len(code) == 4 and code.isdigit():
                     name = row[1].strip() if len(row) > 1 and row[1].strip() else code
                     stock_dict[code] = name
@@ -108,7 +110,7 @@ def remove_stock_from_list(service, stock_id):
         stock_id_str = str(stock_id).zfill(4)
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"'{STOCK_LIST_SHEET}'!A2:A"
+            range=f"'{STOCK_LIST_SHEET}'!A2:A500"
         ).execute()
         values = result.get('values', [])
         rows_to_delete = []
@@ -147,13 +149,13 @@ def remove_stock_from_list(service, stock_id):
 
 def append_request_to_sheets(service, action, stock_id, stock_name="", requester="", status="待審核", note=""):
     now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
-    stock_id_str = str(stock_id).zfill(4)  # 強制保留前導零
+    stock_id_str = str(stock_id).zfill(4)
     values = [[now_str, requester, action, stock_id_str, stock_name, status, note]]
 
     try:
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEET_ID,
-            range=f"{REQUEST_SHEET}!A:G",
+            range=f"'{REQUEST_SHEET}'!A:G",
             valueInputOption="USER_ENTERED",
             body={"values": values}
         ).execute()
@@ -200,8 +202,8 @@ def is_admin(ctx):
 @commands.cooldown(1, 60, commands.BucketType.user)
 async def add_stock(ctx, stock_id: str, *, stock_name: str = ""):
     stock_id = stock_id.strip()
-    if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字，例如 2330 或 0050")
+    if not (stock_id.isdigit() and len(stock_id) <= 4):
+        await ctx.send("股票代碼必須是數字，最多 4 位")
         return
 
     requester = f"{ctx.author} ({ctx.author.id})"
@@ -221,8 +223,8 @@ async def add_stock(ctx, stock_id: str, *, stock_name: str = ""):
     )
 
     if success:
-        await ctx.send(f"已收到申請：新增 **{stock_id}** {stock_name}\n請等待管理員審核。")
-        await notify_admin("新增", stock_id, stock_name, requester)
+        await ctx.send(f"已收到申請：新增 **{stock_id.zfill(4)}** {stock_name}\n請等待管理員審核。")
+        await notify_admin("新增", stock_id.zfill(4), stock_name, requester)
     else:
         await ctx.send("申請失敗，請稍後再試或聯絡管理員。")
 
@@ -231,8 +233,8 @@ async def add_stock(ctx, stock_id: str, *, stock_name: str = ""):
 @commands.cooldown(1, 60, commands.BucketType.user)
 async def remove_stock(ctx, stock_id: str):
     stock_id = stock_id.strip()
-    if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字")
+    if not (stock_id.isdigit() and len(stock_id) <= 4):
+        await ctx.send("股票代碼必須是數字，最多 4 位")
         return
 
     requester = f"{ctx.author} ({ctx.author.id})"
@@ -252,13 +254,12 @@ async def remove_stock(ctx, stock_id: str):
     )
 
     if success:
-        await ctx.send(f"已收到申請：移除 **{stock_id}**\n請等待管理員審核。")
-        await notify_admin("移除", stock_id, "", requester)
+        await ctx.send(f"已收到申請：移除 **{stock_id.zfill(4)}**\n請等待管理員審核。")
+        await notify_admin("移除", stock_id.zfill(4), "", requester)
     else:
         await ctx.send("申請失敗，請稍後再試或聯絡管理員。")
 
 
-# ======================== 管理員專屬指令 ========================
 @bot.command(name="審核新增")
 @commands.check(is_admin)
 async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
@@ -269,7 +270,7 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
 
     stock_id_str = stock_id.zfill(4)
     if len(stock_id_str) != 4:
-        await ctx.send("請輸入 4 位以內的股票代碼（會自動補零）")
+        await ctx.send("請輸入最多 4 位的股票代碼")
         return
 
     service = get_sheets_service()
@@ -277,13 +278,11 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    # 先新增到股票清單
     success_add = add_stock_to_list(service, stock_id_str, stock_name.strip() or stock_id_str)
     if not success_add:
-        await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗，請檢查權限")
+        await ctx.send(f"新增 **{stock_id_str}** 到股票清單失敗")
         return
 
-    # 讀取申請清單所有資料
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -291,37 +290,23 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
         ).execute()
         values = result.get('values', [])
 
-        # 找出最新一筆符合條件的待審核記錄
         latest_row_num = None
         latest_time = None
-        latest_status_raw = None
 
         for idx, row in enumerate(values):
             if len(row) < 6:
                 continue
 
-            action = str(row[2]).strip() if row[2] is not None else ""
-            code_raw = row[3]
-            code = str(code_raw).strip().zfill(4) if code_raw is not None else ""
-            status_raw = row[5] if len(row) > 5 and row[5] is not None else None
+            action = str(row[2]).strip() if row[2] else ""
+            code = str(row[3]).strip().zfill(4) if row[3] is not None else ""
+            status_raw = row[5] if len(row) > 5 else None
             status = str(status_raw).strip() if status_raw is not None else ""
 
-            # debug 輸出（可觀察實際讀到的值，之後可註解掉）
-            print(f"檢查第 {idx+2} 列:")
-            print(f"  action: '{action}'")
-            print(f"  code: '{code}'")
-            print(f"  status: '{status}' (原始: {status_raw!r}, 長度: {len(status) if status else 0})")
-
-            # 比對條件（放寬 status 判斷）
-            if (action == "新增" and
-                code == stock_id_str and
-                status and "待審核" in status):   # 改成包含「待審核」即可，避免空白或變形問題
-
+            if action == "新增" and code == stock_id_str and status == "待審核":
                 request_time = str(row[0]).strip() if row[0] else ""
-                if latest_time is None or request_time > latest_time:
+                if latest_time is None or (request_time and request_time > latest_time):
                     latest_time = request_time
                     latest_row_num = idx + 2
-                    latest_status_raw = status_raw
 
         if latest_row_num is not None:
             update_range = f"{REQUEST_SHEET}!F{latest_row_num}:G{latest_row_num}"
@@ -335,31 +320,30 @@ async def approve_add(ctx, stock_id: str, *, stock_name: str = ""):
             ).execute()
 
             await ctx.send(
-                f"**已審核通過**：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
+                f"已審核通過：新增 **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
                 f"已更新申請時間 {latest_time} 的記錄為「已通過」"
             )
-            print(f"成功更新第 {latest_row_num} 列，原狀態: {latest_status_raw!r}")
         else:
             await ctx.send(
-                f"**已成功新增** **{stock_id_str} {stock_name.strip() or stock_id_str}** 到股票清單\n"
-                f"但未找到任何「待審核」的對應申請記錄，狀態未自動更新，請手動檢查「申請清單」分頁"
+                f"已成功新增 **{stock_id_str}** 到股票清單\n"
+                f"但未找到「待審核」的申請記錄，狀態未自動更新，請手動檢查"
             )
-            print("沒有找到任何符合條件的待審核記錄")
 
     except Exception as e:
-        write_log(f"審核新增時更新申請狀態失敗：{e}")
-        await ctx.send(
-            f"新增 **{stock_id_str}** 到清單成功，但更新申請狀態時發生錯誤：{str(e)}\n"
-            f"請手動檢查「申請清單」分頁，並將對應記錄改為「已通過」"
-        )
+        await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已加入清單")
 
 
 @bot.command(name="審核移除")
 @commands.check(is_admin)
 async def approve_remove(ctx, stock_id: str):
     stock_id = stock_id.strip()
-    if not (stock_id.isdigit() and len(stock_id) == 4):
-        await ctx.send("股票代碼必須是 4 位數字，例如 0050 或 2330")
+    if not stock_id.isdigit():
+        await ctx.send("股票代碼必須是數字")
+        return
+
+    stock_id_str = stock_id.zfill(4)
+    if len(stock_id_str) != 4:
+        await ctx.send("請輸入最多 4 位的股票代碼")
         return
 
     service = get_sheets_service()
@@ -367,14 +351,11 @@ async def approve_remove(ctx, stock_id: str):
         await ctx.send("無法連線 Google Sheets")
         return
 
-    stock_id_str = stock_id.zfill(4)
     success = remove_stock_from_list(service, stock_id_str)
-
     if not success:
-        await ctx.send(f"移除 **{stock_id_str}** 失敗，請檢查 Google Sheets 權限")
+        await ctx.send(f"移除 **{stock_id_str}** 失敗")
         return
 
-    # 更新所有符合條件的申請記錄為「已通過」
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=GOOGLE_SHEET_ID,
@@ -382,27 +363,41 @@ async def approve_remove(ctx, stock_id: str):
         ).execute()
         values = result.get('values', [])
 
-        updated_count = 0
-        for idx, row in enumerate(values):
-            if len(row) >= 5 and row[2] == "移除" and str(row[3]).strip() == stock_id_str:
-                row_num = idx + 2
-                update_range = f"{REQUEST_SHEET}!F{row_num}:G{row_num}"
-                update_values = [["已通過", "管理員已審核通過"]]
-                service.spreadsheets().values().update(
-                    spreadsheetId=GOOGLE_SHEET_ID,
-                    range=update_range,
-                    valueInputOption="USER_ENTERED",
-                    body={"values": update_values}
-                ).execute()
-                updated_count += 1
+        latest_row_num = None
+        latest_time = None
 
-        if updated_count > 0:
-            await ctx.send(f"已審核通過：移除 **{stock_id_str}** 從股票清單\n已更新 {updated_count} 筆申請狀態為「已通過」")
+        for idx, row in enumerate(values):
+            if len(row) < 6:
+                continue
+
+            action = str(row[2]).strip() if row[2] else ""
+            code = str(row[3]).strip().zfill(4) if row[3] is not None else ""
+            status_raw = row[5] if len(row) > 5 else None
+            status = str(status_raw).strip() if status_raw is not None else ""
+
+            if action == "移除" and code == stock_id_str and status == "待審核":
+                request_time = str(row[0]).strip() if row[0] else ""
+                if latest_time is None or (request_time and request_time > latest_time):
+                    latest_time = request_time
+                    latest_row_num = idx + 2
+
+        if latest_row_num is not None:
+            update_range = f"{REQUEST_SHEET}!F{latest_row_num}:G{latest_row_num}"
+            update_values = [["已通過", "管理員已審核通過"]]
+
+            service.spreadsheets().values().update(
+                spreadsheetId=GOOGLE_SHEET_ID,
+                range=update_range,
+                valueInputOption="USER_ENTERED",
+                body={"values": update_values}
+            ).execute()
+
+            await ctx.send(f"已審核通過：移除 **{stock_id_str}** 從股票清單\n已更新申請時間 {latest_time} 的記錄為「已通過」")
         else:
-            await ctx.send(f"已成功移除 **{stock_id_str}**\n未找到對應申請記錄，無需更新狀態")
+            await ctx.send(f"已成功移除 **{stock_id_str}**\n未找到對應待審核記錄，狀態未更新")
 
     except Exception as e:
-        await ctx.send(f"更新申請狀態失敗：{e}\n但股票已移除")
+        await ctx.send(f"更新申請狀態失敗：{str(e)}\n但股票已移除")
 
 
 @bot.command(name="拒絕申請")
@@ -433,10 +428,10 @@ async def reject_request(ctx, request_row: int, *, reason: str = "未說明原�
 
 # ======================== 工具函式 ========================
 def write_log(msg):
-    now_str = datetime.now().strftime('%Y年%m月%d日 %H時%M分%S秒')
+    now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open("error.log", "a", encoding="utf-8") as f:
         f.write(f"{now_str} {msg}\n")
-    print(f"{now_str} {msg}")
+    print(msg)
 
 
 def send_discord_push(message: str):
@@ -447,7 +442,7 @@ def send_discord_push(message: str):
     try:
         resp = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
         if resp.status_code != 204:
-            write_log(f"Discord 推播失敗，狀態碼：{resp.status_code}，回應：{resp.text}")
+            write_log(f"Discord 推播失敗，狀態碼：{resp.status_code}")
         else:
             write_log("Discord 推播成功")
     except Exception as e:
@@ -457,20 +452,17 @@ def send_discord_push(message: str):
 def is_trading_day(dl: DataLoader, check_date: str, is_after_close: bool) -> bool:
     symbol_for_check = "2330"
     try:
-        if not is_after_close:
-            yesterday = (datetime.strptime(check_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-            df = dl.taiwan_stock_daily(symbol_for_check, start_date=yesterday, end_date=yesterday)
-            if not df.empty:
-                write_log(f"盤中檢查：{yesterday} 有交易資料，今天很可能為交易日")
-                return True
-            else:
-                write_log(f"盤中檢查：{yesterday} 無交易資料，今天很可能休市")
-                return False
-        else:
-            write_log(f"盤後模式：直接視為交易日（忽略當天日K尚未補齊）")
+        yesterday = (datetime.strptime(check_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        df = dl.taiwan_stock_daily(symbol_for_check, start_date=yesterday, end_date=yesterday)
+        if not df.empty:
+            del df
+            gc.collect()
             return True
+        del df
+        gc.collect()
+        return False
     except Exception as e:
-        write_log(f"交易日檢查發生錯誤：{e}，預設為非交易日")
+        write_log(f"交易日檢查錯誤：{e}")
         return False
 
 
@@ -480,40 +472,23 @@ def get_latest_available_price(dl, stock_id: str):
     tw_symbol = f"{stock_id}.TW"
 
     try:
-        df = dl.get_data(dataset="TaiwanStockPrice", data_id=stock_id, start_date=today)
-        if df is not None and not df.empty and 'close' in df.columns:
-            latest = df.iloc[-1]
-            time_str = latest["date"]
-            if "Time" in df.columns and pd.notna(latest.get("Time", None)):
-                time_str = f"{latest['date']} {latest['Time']}"
+        df = dl.taiwan_stock_daily(stock_id, start_date=today, end_date=today)
+        if not df.empty:
+            latest = df.iloc[0]
             price = float(latest["close"])
-            write_log(f"{stock_id} 取得當天最新分鐘價（FinMind）：{price:.2f} @ {time_str}")
+            time_str = today
+            del df
+            gc.collect()
             return {
                 "price": price,
                 "time": time_str,
-                "source": "today_tick_finmind",
-                "is_latest": True,
-                "finmind_success": True
-            }
-    except Exception as e:
-        write_log(f"{stock_id} FinMind 當天分鐘價失敗：{e}")
-
-    try:
-        df_day = dl.taiwan_stock_daily(stock_id, start_date=today, end_date=today)
-        if not df_day.empty:
-            price = float(df_day.iloc[0]["close"])
-            write_log(f"{stock_id} 取得當天日收盤價（FinMind）：{price:.2f}")
-            return {
-                "price": price,
-                "time": f"{today} 收盤",
                 "source": "today_daily_finmind",
                 "is_latest": True,
                 "finmind_success": True
             }
     except Exception as e:
-        write_log(f"{stock_id} FinMind 當天日收盤價失敗：{e}")
+        write_log(f"FinMind 當天日K失敗：{e}")
 
-    write_log(f"{stock_id} FinMind 今天完全無資料 → 改用 yfinance 備援")
     try:
         ticker = yf.Ticker(tw_symbol)
         hist = ticker.history(period="1d", interval="1m")
@@ -521,7 +496,8 @@ def get_latest_available_price(dl, stock_id: str):
             latest = hist.iloc[-1]
             price = float(latest["Close"])
             time_str = latest.name.strftime("%Y-%m-%d %H:%M:%S")
-            write_log(f"{stock_id} yfinance 取得最新分鐘價：{price:.2f} @ {time_str}")
+            del hist
+            gc.collect()
             return {
                 "price": price,
                 "time": time_str,
@@ -529,13 +505,17 @@ def get_latest_available_price(dl, stock_id: str):
                 "is_latest": True,
                 "finmind_success": False
             }
+    except Exception as e:
+        write_log(f"yfinance 即時資料失敗：{e}")
 
+    try:
         hist_daily = ticker.history(period="5d")
         if not hist_daily.empty:
             latest = hist_daily.iloc[-1]
             price = float(latest["Close"])
             date_str = latest.name.strftime("%Y-%m-%d")
-            write_log(f"{stock_id} yfinance 取得最近日收盤價：{price:.2f} ({date_str})")
+            del hist_daily
+            gc.collect()
             return {
                 "price": price,
                 "time": date_str,
@@ -544,9 +524,8 @@ def get_latest_available_price(dl, stock_id: str):
                 "finmind_success": False
             }
     except Exception as e:
-        write_log(f"{stock_id} yfinance 備援也失敗：{e}")
+        write_log(f"yfinance 最近日K失敗：{e}")
 
-    write_log(f"{stock_id} FinMind 與 yfinance 都無法取得任何價格")
     return None
 
 
@@ -554,10 +533,15 @@ def get_today_close(dl, stock_id: str, date_str: str) -> Optional[float]:
     try:
         df = dl.taiwan_stock_daily(stock_id, start_date=date_str, end_date=date_str)
         if not df.empty:
-            return float(df.iloc[0]["close"])
+            price = float(df.iloc[0]["close"])
+            del df
+            gc.collect()
+            return price
+        del df
+        gc.collect()
         return None
     except Exception as e:
-        write_log(f"{stock_id} 取得 {date_str} 收盤價失敗：{e}")
+        write_log(f"取得 {date_str} 收盤價失敗：{e}")
         return None
 
 
@@ -600,7 +584,10 @@ def get_stock_data(dl, stock_id: str) -> Optional[Dict]:
 def calculate_ma(prices, window):
     if len(prices) < window:
         return None
-    return pd.Series(prices).rolling(window).mean().iloc[-1]
+    s = pd.Series(prices)
+    result = s.rolling(window).mean().iloc[-1]
+    del s
+    return result
 
 
 def get_intraday_advice(latest, ma5, ma20, ma60, pct):
@@ -671,6 +658,8 @@ async def monitor_stocks():
 
     STOCK_NAME_MAP = get_current_stock_list(service)
     STOCK_LIST = list(STOCK_NAME_MAP.keys())
+    del service
+    gc.collect()
 
     dl = DataLoader()
     try:
@@ -683,9 +672,9 @@ async def monitor_stocks():
 
     if not is_trading_day(dl, now.strftime("%Y-%m-%d"), is_after_close):
         if is_after_close:
-            write_log(f"盤後模式：直接視為交易日（忽略當天日K尚未補齊）")
+            write_log("盤後模式：視為交易日")
         else:
-            write_log(f"今天非交易日，跳過本次監控")
+            write_log("今天非交易日，跳過監控")
             return
 
     write_log("通過交易日檢查，開始處理股票資料...")
@@ -694,77 +683,108 @@ async def monitor_stocks():
     is_today_push = (now.hour >= 14)
 
     for stock_id in STOCK_LIST:
-        stock_name = STOCK_NAME_MAP.get(stock_id, stock_id)
-        stock = get_stock_data(dl, stock_id)
-        if not stock:
-            write_log(f"{stock_id} 無法取得資料，跳過")
-            continue
+        try:
+            stock_name = STOCK_NAME_MAP.get(stock_id, stock_id)
+            stock = get_stock_data(dl, stock_id)
+            if not stock:
+                write_log(f"{stock_id} 無法取得資料，跳過")
+                continue
 
-        df = dl.taiwan_stock_daily(
-            stock_id,
-            start_date=(now - timedelta(days=61)).strftime("%Y-%m-%d"),
-            end_date=now.strftime("%Y-%m-%d")
-        )
-        closes = df["close"].tolist() if not df.empty else []
+            # 只抓最近 20 天資料，大幅減少記憶體使用
+            df = dl.taiwan_stock_daily(
+                stock_id,
+                start_date=(now - timedelta(days=20)).strftime("%Y-%m-%d"),
+                end_date=now.strftime("%Y-%m-%d")
+            )
 
-        ma5 = calculate_ma(closes, 5)
-        ma20 = calculate_ma(closes, 20)
-        ma60 = calculate_ma(closes, 60)
+            closes = df["close"].tolist() if not df.empty else []
 
-        ma5_str = f"{ma5:.2f}" if ma5 is not None else "無資料"
-        ma20_str = f"{ma20:.2f}" if ma20 is not None else "無資料"
-        ma60_str = f"{ma60:.2f}" if ma60 is not None else "無資料"
+            ma5 = calculate_ma(closes, 5)
+            ma20 = calculate_ma(closes, 20)
+            ma60 = calculate_ma(closes, 60)
 
-        latest = stock["latest_price"]
-        yesterday_close = stock["yesterday_close"]
-        change = latest - yesterday_close
-        pct = change / yesterday_close * 100 if yesterday_close != 0 else 0
+            # 立刻釋放 pandas 物件
+            del df
+            del closes
+            gc.collect()
 
-        if stock.get("finmind_success", False):
-            if stock["source"] == "today_tick_finmind":
-                source_note = f"（{stock['latest_time']}）"
-            elif stock["source"] == "today_daily_finmind":
-                source_note = f"（{stock['latest_time']} 當天收盤）"
+            ma5_str = f"{ma5:.2f}" if ma5 is not None else "無資料"
+            ma20_str = f"{ma20:.2f}" if ma20 is not None else "無資料"
+            ma60_str = f"{ma60:.2f}" if ma60 is not None else "無資料"
+
+            latest = stock["latest_price"]
+            yesterday_close = stock["yesterday_close"]
+            change = latest - yesterday_close
+            pct = change / yesterday_close * 100 if yesterday_close != 0 else 0
+
+            if stock.get("finmind_success", False):
+                if stock["source"] == "today_tick_finmind":
+                    source_note = f"（{stock['latest_time']}）"
+                elif stock["source"] == "today_daily_finmind":
+                    source_note = f"（{stock['latest_time']} 當天收盤）"
+                else:
+                    source_note = f"（{stock['latest_time']}）"
             else:
-                source_note = f"（{stock['latest_time']}）"
-        else:
-            if stock["source"] == "today_yfinance":
-                source_note = f"（{stock['latest_time']}）（yfinance 備援）"
-            else:
-                source_note = f"（{stock['latest_time']} 收盤）（yfinance 備援）"
+                if stock["source"] == "today_yfinance":
+                    source_note = f"（{stock['latest_time']}）（yfinance 備援）"
+                else:
+                    source_note = f"（{stock['latest_time']} 收盤）（yfinance 備援）"
 
-        footnote = "※ 資料來源：FinMind（yfinance 為備援來源）"
+            footnote = "※ 資料來源：FinMind（yfinance 為備援來源）"
 
-        if is_yesterday_push:
+            if is_yesterday_push:
+                msg = [
+                    f"---",
+                    f"【{stock_id} {stock_name} 昨日收盤價 {now.strftime('%Y年%m月%d日')}】",
+                    f"時間：{now_str}",
+                    "━━━━━━━━━━━━━━",
+                    f"昨收：{yesterday_close:.2f} 元",
+                    f"5日均線：{ma5_str}",
+                    f"20日均線：{ma20_str}",
+                    f"60日均線：{ma60_str}",
+                    f"建議：{get_intraday_advice(yesterday_close, ma5, ma20, ma60, 0)}",
+                    "※ 資料來源：FinMind"
+                ]
+                send_discord_push("\n".join(msg))
+                write_log(f"{stock_id} 推播昨日收盤價完成")
+                gc.collect()
+                continue
+
+            if is_today_push and stock["is_after_close"]:
+                close_price_for_sheet = get_today_close(dl, stock_id, stock["date"])
+                if close_price_for_sheet is None:
+                    write_log(f"{stock_id} 盤後寫入：FinMind 當天日K尚未有資料，使用最新價代替")
+                    close_price = stock["latest_price"]
+                    close_note = f"{stock['latest_time']} （盤後暫用最新價，等待日K補齊）"
+                else:
+                    close_price = close_price_for_sheet
+                    close_note = f"{stock['latest_time']} （日K正式收盤）"
+
+                msg = [
+                    f"---",
+                    f"【{stock_id} {stock_name} 價格監控 {now.strftime('%Y年%m月%d日')}】",
+                    f"時間：{now_str}",
+                    "━━━━━━━━━━━━━━",
+                    f"最新價：{latest:.2f} 元{source_note}",
+                    f"昨收：{yesterday_close:.2f} 元",
+                    f"漲跌：{change:+.2f}（{pct:+.2f}%）",
+                    f"5日均線：{ma5_str}",
+                    f"20日均線：{ma20_str}",
+                    f"60日均線：{ma60_str}",
+                    f"今日收盤：{close_price:.2f} 元{close_note}",
+                    f"行情摘要：{get_after_close_summary(latest, ma5, ma20, ma60, change)}",
+                    footnote
+                ]
+
+                send_discord_push("\n".join(msg))
+                write_log(f"{stock_id} 推播盤後資訊完成")
+                gc.collect()
+                continue
+
+            # 盤中推播
             msg = [
                 f"---",
-                f"【{stock_id} {stock_name} 昨日收盤價 {now.strftime('%Y年%m月%d日')}】",
-                f"時間：{now_str}",
-                "━━━━━━━━━━━━━━",
-                f"昨收：{yesterday_close:.2f} 元",
-                f"5日均線：{ma5_str}",
-                f"20日均線：{ma20_str}",
-                f"60日均線：{ma60_str}",
-                f"建議：{get_intraday_advice(yesterday_close, ma5, ma20, ma60, 0)}",
-                "※ 資料來源：FinMind"
-            ]
-            send_discord_push("\n".join(msg))
-            write_log(f"{stock_id} 推播昨日收盤價完成")
-            continue
-
-        if is_today_push and stock["is_after_close"]:
-            close_price_for_sheet = get_today_close(dl, stock_id, stock["date"])
-            if close_price_for_sheet is None:
-                write_log(f"{stock_id} 盤後寫入：FinMind 當天日K尚未有資料，使用最新價代替")
-                close_price = stock["latest_price"]
-                close_note = f"{stock['latest_time']} （盤後暫用最新價，等待日K補齊）"
-            else:
-                close_price = close_price_for_sheet
-                close_note = f"{stock['latest_time']} （日K正式收盤）"
-
-            msg = [
-                f"---",
-                f"【{stock_id} {stock_name} 價格監控 {now.strftime('%Y年%m月%d日')}】",
+                f"【{stock_id} {stock_name} 盤中監控 {now.strftime('%Y年%m月%d日')}】",
                 f"時間：{now_str}",
                 "━━━━━━━━━━━━━━",
                 f"最新價：{latest:.2f} 元{source_note}",
@@ -773,36 +793,26 @@ async def monitor_stocks():
                 f"5日均線：{ma5_str}",
                 f"20日均線：{ma20_str}",
                 f"60日均線：{ma60_str}",
-                f"今日收盤：{close_price:.2f} 元{close_note}",
-                f"行情摘要：{get_after_close_summary(latest, ma5, ma20, ma60, change)}",
+                f"建議：{get_intraday_advice(latest, ma5, ma20, ma60, pct)}",
                 footnote
             ]
 
-            # 已移除 save_to_sheets 呼叫，避免搞亂股票清單分頁
-            # 歷史資料應由 stock-history-fill.py 負責補齊
-
             send_discord_push("\n".join(msg))
-            write_log(f"{stock_id} 推播盤後資訊完成")
-            continue
+            write_log(f"{stock_id} 盤中推播完成")
 
-        # 盤中推播
-        msg = [
-            f"---",
-            f"【{stock_id} {stock_name} 盤中監控 {now.strftime('%Y年%m月%d日')}】",
-            f"時間：{now_str}",
-            "━━━━━━━━━━━━━━",
-            f"最新價：{latest:.2f} 元{source_note}",
-            f"昨收：{yesterday_close:.2f} 元",
-            f"漲跌：{change:+.2f}（{pct:+.2f}%）",
-            f"5日均線：{ma5_str}",
-            f"20日均線：{ma20_str}",
-            f"60日均線：{ma60_str}",
-            f"建議：{get_intraday_advice(latest, ma5, ma20, ma60, pct)}",
-            footnote
-        ]
+        except Exception as e:
+            write_log(f"{stock_id} 處理錯誤：{e}")
+        finally:
+            # 每支股票強制回收兩次
+            gc.collect()
+            time.sleep(0.3)  # 微小延遲，讓系統有機會釋放
+            gc.collect()
 
-        send_discord_push("\n".join(msg))
-        write_log(f"{stock_id} 盤中推播完成")
+    # 整個循環結束後再回收一次
+    del STOCK_NAME_MAP
+    del STOCK_LIST
+    gc.collect()
+    write_log("本次監控循環結束，已強制回收記憶體")
 
 
 # 啟動 Bot
